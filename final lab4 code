@@ -1,0 +1,427 @@
+#include <EFM8LB1.h>
+#include <stdio.h>
+
+#define SYSCLK   24500000L
+#define BAUDRATE 115200L
+
+#define LCD_RS P1_7
+#define LCD_E  P2_0
+#define LCD_D4 P1_3
+#define LCD_D5 P1_2
+#define LCD_D6 P1_1
+#define LCD_D7 P1_0
+#define CHARS_PER_LINE 16
+
+// Buttons / pins
+#define capbutton       P2_1   // cap mode + unit cycle
+#define adcpin          P2_2   // ADC input
+#define resbutton       P2_3   // resistance mode
+#define maxbutton       P2_4   // MAX hold
+#define minbutton       P2_5   // MIN hold
+#define freqbutton      P2_6   // frequency mode
+
+#define cap_mode 0
+#define resistor_mode 1
+#define freq_mode 2
+
+// Cap units
+#define CAP_UNIT_NF 0
+#define CAP_UNIT_UF 1
+#define CAP_UNIT_PF 2
+
+// ADC thresholds (12-bit 0..4095)
+#define OPEN_THRESHOLD   4080U
+#define SHORT_THRESHOLD  5U
+
+// "Resistance mode" output = scaled ADC (your chosen approach)
+#define SCALE_NUM 117UL
+#define SCALE_DEN 100UL
+
+// Faster button timing
+#define DEBOUNCE_MS 5
+#define RELEASE_MS  5
+
+unsigned char current_mode = cap_mode;
+unsigned char overflow_count;
+unsigned char cap_unit_mode = CAP_UNIT_NF;
+
+// Min/Max storage
+unsigned long cap_max = 0, cap_min = 0xFFFFFFFFUL;
+unsigned long res_max = 0, res_min = 0xFFFFFFFFUL;
+unsigned long freq_max = 0, freq_min = 0xFFFFFFFFUL;
+
+char _c51_external_startup (void)
+{
+	SFRPAGE = 0x00;
+	WDTCN = 0xDE;
+	WDTCN = 0xAD;
+
+	VDM0CN |= 0x80;
+	RSTSRC = 0x02;
+
+	// 24.5 MHz
+	CLKSEL = 0x00;
+	CLKSEL = 0x00;
+	while ((CLKSEL & 0x80) == 0);
+
+	P0MDOUT |= 0x10; // UART0 TX push-pull
+
+	// Inputs w/ pullups for buttons: P2.1, P2.3, P2.4, P2.5, P2.6
+	// mask = 0x02 + 0x08 + 0x10 + 0x20 + 0x40 = 0x7A
+	P2MDOUT &= ~(0x7A);
+	P2      |=  (0x7A);
+	P2SKIP  |=  (0x7A);
+
+	// P2.2 analog input:
+	P2MDIN  &= ~(1<<2);
+
+	XBR0 = 0x01;
+	XBR1 = 0x10; // T0 on P0.0
+	XBR2 = 0x40;
+
+	// UART0 using Timer1
+	SCON0 = 0x10;
+	CKCON0 |= 0b_0000_0000;
+	TH1 = 0x100 - ((SYSCLK/BAUDRATE)/(2L*12L));
+	TL1 = TH1;
+	TMOD &= ~0xF0;
+	TMOD |=  0x20;
+	TR1 = 1;
+	TI  = 1;
+
+	return 0;
+}
+
+void Timer3us(unsigned char us)
+{
+	unsigned char i;
+	CKCON0 |= 0b_0100_0000;
+
+	TMR3RL = (-(SYSCLK)/1000000L);
+	TMR3   = TMR3RL;
+
+	TMR3CN0 = 0x04;
+	for (i = 0; i < us; i++)
+	{
+		while (!(TMR3CN0 & 0x80));
+		TMR3CN0 &= ~(0x80);
+
+		if (TF0)
+		{
+			TF0 = 0;
+			overflow_count++;
+		}
+	}
+	TMR3CN0 = 0;
+}
+
+void waitms (unsigned int ms)
+{
+	unsigned int j;
+	for (j = ms; j != 0; j--)
+	{
+		Timer3us(249);
+		Timer3us(249);
+		Timer3us(249);
+		Timer3us(250);
+	}
+}
+
+void TIMER0_Init(void)
+{
+	TMOD &= 0xF0;
+	TMOD |= 0x05; // counter mode
+	TR0 = 0;
+}
+
+// LCD helpers
+void LCD_pulse (void)
+{
+	LCD_E = 1;
+	Timer3us(40);
+	LCD_E = 0;
+}
+
+void LCD_byte (unsigned char x)
+{
+	ACC = x;
+	LCD_D7 = ACC_7; LCD_D6 = ACC_6; LCD_D5 = ACC_5; LCD_D4 = ACC_4;
+	LCD_pulse(); Timer3us(40);
+
+	ACC = x;
+	LCD_D7 = ACC_3; LCD_D6 = ACC_2; LCD_D5 = ACC_1; LCD_D4 = ACC_0;
+	LCD_pulse();
+}
+
+void WriteData (unsigned char x)    { LCD_RS = 1; LCD_byte(x); waitms(2); }
+void WriteCommand (unsigned char x) { LCD_RS = 0; LCD_byte(x); waitms(5); }
+
+void LCD_4BIT (void)
+{
+	LCD_E = 0;
+	waitms(20);
+	WriteCommand(0x33);
+	WriteCommand(0x33);
+	WriteCommand(0x32);
+	WriteCommand(0x28);
+	WriteCommand(0x0c);
+	WriteCommand(0x01);
+	waitms(20);
+}
+
+void LCDprint(char * string, unsigned char line, bit clear)
+{
+	int j;
+	WriteCommand(line == 2 ? 0xC0 : 0x80);
+	waitms(2);
+
+	for (j = 0; string[j] != 0; j++) WriteData(string[j]);
+	if (clear) for (; j < CHARS_PER_LINE; j++) WriteData(' ');
+}
+
+// ADC
+void InitADC (void)
+{
+	SFRPAGE = 0x00;
+	ADC0CN0 = 0x80;
+	ADC0CF0 = 0x20;
+	ADC0CF1 = 0x00;
+	REF0CN  = 0x18;
+}
+
+unsigned int ReadADC (unsigned char channel)
+{
+	unsigned int v;
+	SFRPAGE = 0x00;
+	ADC0MX = channel;
+
+	ADC0CN0 &= ~0x20;
+	ADC0CN0 |=  0x10;
+	while ((ADC0CN0 & 0x20) == 0);
+
+	v = ((unsigned int)ADC0H << 8) | ADC0L;
+	return (v & 0x0FFF);
+}
+
+// Fast debounced press detect (active low)
+bit Pressed(bit pinval)
+{
+	if (pinval == 0)
+	{
+		waitms(DEBOUNCE_MS);
+		if (pinval == 0) return 1;
+	}
+	return 0;
+}
+
+void main (void)
+{
+	unsigned long F, cap_nf, cap_pf, uf_int, uf_dec;
+	unsigned long res_value;
+	unsigned int adc_result;
+
+	unsigned int i;
+	unsigned long total_counts;
+	char buf[16];
+
+	TIMER0_Init();
+	InitADC();
+	LCD_4BIT();
+
+	while (1)
+	{
+		// Mode buttons (fast)
+		if (Pressed(resbutton))
+		{
+			current_mode = resistor_mode;
+			while (resbutton == 0) {;}
+			waitms(RELEASE_MS);
+		}
+
+		if (Pressed(freqbutton))
+		{
+			current_mode = freq_mode;
+			while (freqbutton == 0) {;}
+			waitms(RELEASE_MS);
+		}
+
+		// Cap button: switch to cap if not in cap; otherwise cycle units
+		if (Pressed(capbutton))
+		{
+			if (current_mode != cap_mode)
+			{
+				current_mode = cap_mode; // instant switch
+			}
+			else
+			{
+				// cycle nF -> uF -> pF
+				if (cap_unit_mode == CAP_UNIT_NF) cap_unit_mode = CAP_UNIT_UF;
+				else if (cap_unit_mode == CAP_UNIT_UF) cap_unit_mode = CAP_UNIT_PF;
+				else cap_unit_mode = CAP_UNIT_NF;
+			}
+			while (capbutton == 0) {;}
+			waitms(RELEASE_MS);
+		}
+
+		// Reset min/max if MAX+MIN held
+		if (maxbutton == 0 && minbutton == 0)
+		{
+			waitms(120);
+			if (maxbutton == 0 && minbutton == 0)
+			{
+				cap_max = res_max = freq_max = 0;
+				cap_min = res_min = freq_min = 0xFFFFFFFFUL;
+				LCDprint("RESET", 1, 1);
+				LCDprint("Min/Max cleared", 2, 1);
+				waitms(350);
+			}
+		}
+
+	//frequency measurement
+		if (current_mode == cap_mode || current_mode == freq_mode)
+		{
+			// measure 1s total in 10 chunks for responsiveness
+			total_counts = 0;
+
+			for (i = 0; i < 10; i++)
+			{
+				// allow fast switching mid-measure
+				if (Pressed(resbutton))
+				{
+					current_mode = resistor_mode;
+					while (resbutton == 0) {;}
+					waitms(RELEASE_MS);
+					break;
+				}
+				if (Pressed(freqbutton))
+				{
+					current_mode = freq_mode;
+					while (freqbutton == 0) {;}
+					waitms(RELEASE_MS);
+				}
+				if (Pressed(capbutton))
+				{
+					if (current_mode != cap_mode) current_mode = cap_mode;
+					else
+					{
+						if (cap_unit_mode == CAP_UNIT_NF) cap_unit_mode = CAP_UNIT_UF;
+						else if (cap_unit_mode == CAP_UNIT_UF) cap_unit_mode = CAP_UNIT_PF;
+						else cap_unit_mode = CAP_UNIT_NF;
+					}
+					while (capbutton == 0) {;}
+					waitms(RELEASE_MS);
+				}
+
+				TL0 = 0; TH0 = 0; overflow_count = 0; TF0 = 0;
+				TR0 = 1;
+				waitms(100);
+				TR0 = 0;
+
+				total_counts += overflow_count * 65536UL + TH0 * 256UL + TL0;
+			}
+
+			if (current_mode != cap_mode && current_mode != freq_mode)
+				continue;
+
+			F = total_counts;
+
+			//freq mode
+			if (current_mode == freq_mode)
+			{
+				if (F == 0)
+				{
+					LCDprint("Frequency:", 1, 1);
+					LCDprint("Insert C", 2, 1);
+				}
+				else
+				{
+					if (F > freq_max) freq_max = F;
+					if (F < freq_min) freq_min = F;
+
+					if (maxbutton == 0) { LCDprint("Freq MAX:", 1, 1); F = freq_max; }
+					else if (minbutton == 0) { LCDprint("Freq MIN:", 1, 1); F = freq_min; }
+					else LCDprint("Frequency:", 1, 1);
+
+					sprintf(buf, "%lu Hz", F);
+					LCDprint(buf, 2, 1);
+				}
+			}
+			//cap mode
+			else
+			{
+				if (F == 0)
+				{
+					LCDprint("Capacitance:", 1, 1);
+					LCDprint("Insert C", 2, 1);
+				}
+				else
+				{
+					cap_nf = (unsigned long)(1440000 / (5.0 * F)); // your existing formula style
+
+					if (cap_nf == 0)
+					{
+						LCDprint("Capacitance:", 1, 1);
+						LCDprint("Insert C", 2, 1);
+					}
+					else
+					{
+						if (cap_nf > cap_max) cap_max = cap_nf;
+						if (cap_nf < cap_min) cap_min = cap_nf;
+
+						if (maxbutton == 0) { LCDprint("Cap MAX:", 1, 1); cap_nf = cap_max; }
+						else if (minbutton == 0) { LCDprint("Cap MIN:", 1, 1); cap_nf = cap_min; }
+						else LCDprint("Capacitance:", 1, 1);
+
+						if (cap_unit_mode == CAP_UNIT_NF)
+						{
+							sprintf(buf, "%lunF", cap_nf);
+						}
+						else if (cap_unit_mode == CAP_UNIT_PF)
+						{
+							cap_pf = cap_nf * 1000UL;
+							sprintf(buf, "%lupF", cap_pf);
+						}
+						else
+						{
+							uf_int = cap_nf / 1000UL;
+							uf_dec = cap_nf % 1000UL;
+							sprintf(buf, "%lu.%03luuF", uf_int, uf_dec);
+						}
+
+						LCDprint(buf, 2, 1);
+					}
+				}
+			}
+		}
+		// resistance mode
+		else
+		{
+			adc_result = ReadADC(0x0F);
+
+			if (adc_result >= OPEN_THRESHOLD || adc_result <= SHORT_THRESHOLD)
+				res_value = 0;
+			else
+				res_value = ((unsigned long)adc_result * SCALE_NUM + 50) / SCALE_DEN;
+
+			if (res_value == 0)
+			{
+				LCDprint("Resistance:", 1, 1);
+				LCDprint("Insert R", 2, 1);
+			}
+			else
+			{
+				if (res_value > res_max) res_max = res_value;
+				if (res_value < res_min) res_min = res_value;
+
+				if (maxbutton == 0) { LCDprint("Res MAX:", 1, 1); res_value = res_max; }
+				else if (minbutton == 0) { LCDprint("Res MIN:", 1, 1); res_value = res_min; }
+				else LCDprint("Resistance:", 1, 1);
+
+				sprintf(buf, "%lu", res_value);
+				LCDprint(buf, 2, 1);
+			}
+
+			waitms(20); // fast refresh
+		}
+	}
+}
