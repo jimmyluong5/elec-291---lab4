@@ -1,9 +1,3 @@
-// lab4.c: Frequency on T0 and "Resistance" mode shows (ADC reading * 1.17)
-// Per request: do NOT compute resistance from voltage divider anymore.
-// Uses 12-bit ADC reading from P2.2 (0..4095), then scales by 1.17 using integer math.
-//
-// Scaling: scaled = adc * 117 / 100  (˜1.17) with rounding.
-
 #include <EFM8LB1.h>
 #include <stdio.h>
 
@@ -11,7 +5,6 @@
 #define BAUDRATE 115200L
 
 #define LCD_RS P1_7
-// #define LCD_RW Px_x // Not used. Connect to GND
 #define LCD_E  P2_0
 #define LCD_D4 P1_3
 #define LCD_D5 P1_2
@@ -26,16 +19,25 @@
 #define cap_mode 0
 #define resistor_mode 1
 
-// If P2.2 is floating/open it tends to read full-scale; show 0 like you wanted
+// ADC open/short thresholds (12-bit ADC: 0..4095)
 #define OPEN_THRESHOLD   4080U
 #define SHORT_THRESHOLD  5U
 
-// Scale by ~1.17
+// Scale by ~1.17 for "resistance mode" output (per your request)
 #define SCALE_NUM 117UL
 #define SCALE_DEN 100UL
 
+// Capacitance unit modes
+#define CAP_UNIT_NF 0
+#define CAP_UNIT_UF 1
+#define CAP_UNIT_PF 2
+
 unsigned char current_mode = cap_mode;
 unsigned char overflow_count;
+
+// capacitance unit cycling state
+unsigned char cap_unit_mode = CAP_UNIT_NF;
+unsigned char prev_unitbutton = 1;
 
 char _c51_external_startup (void)
 {
@@ -46,7 +48,6 @@ char _c51_external_startup (void)
 	VDM0CN |= 0x80;
 	RSTSRC = 0x02;
 
-	// 24.5 MHz
 	CLKSEL = 0x00;
 	CLKSEL = 0x00;
 	while ((CLKSEL & 0x80) == 0);
@@ -62,7 +63,7 @@ char _c51_external_startup (void)
 	P2MDIN  &= ~(1<<2);
 
 	XBR0     = 0x01;    // UART0
-	XBR1     = 0x10;    // T0
+	XBR1     = 0x10;    // T0 on P0.0
 	XBR2     = 0x40;    // enable crossbar
 
 	// UART0 using Timer1
@@ -92,6 +93,7 @@ void Timer3us(unsigned char us)
 		while (!(TMR3CN0 & 0x80));
 		TMR3CN0 &= ~(0x80);
 
+		// Count Timer0 overflows while we wait (for frequency measurement)
 		if (TF0)
 		{
 			TF0 = 0;
@@ -213,9 +215,13 @@ unsigned int ReadADC (unsigned char channel)
 void main (void)
 {
 	unsigned long F;
-	unsigned long cap;
+	unsigned long cap_nf;
+	unsigned long cap_pf;
+	unsigned long uf_int, uf_dec;
+
 	unsigned long scaled;
 	unsigned int adc_result;
+
 	char buf[16];
 
 	TIMER0_Init();
@@ -226,18 +232,42 @@ void main (void)
 
 	while (1)
 	{
-		if (unitbutton == 0)
+		// --- unitbutton edge detect (P2.1) ---
+		if ((prev_unitbutton == 1) && (unitbutton == 0))
 		{
-			current_mode = cap_mode;
-			waitms(5);
+			waitms(20);
+			if (unitbutton == 0)
+			{
+				if (current_mode != cap_mode)
+				{
+					current_mode = cap_mode;
+				}
+				else
+				{
+					// cycle nF -> uF -> pF
+					if (cap_unit_mode == CAP_UNIT_NF) cap_unit_mode = CAP_UNIT_UF;
+					else if (cap_unit_mode == CAP_UNIT_UF) cap_unit_mode = CAP_UNIT_PF;
+					else cap_unit_mode = CAP_UNIT_NF;
+				}
+				while (unitbutton == 0) {;}
+				waitms(20);
+			}
 		}
+		prev_unitbutton = unitbutton;
 
+		// --- resistorbutton (P2.3) ---
 		if (resistorbutton == 0)
 		{
-			current_mode = resistor_mode;
-			waitms(5);
+			waitms(20);
+			if (resistorbutton == 0)
+			{
+				current_mode = resistor_mode;
+				while (resistorbutton == 0) {;}
+				waitms(20);
+			}
 		}
 
+		// --- modes ---
 		if (current_mode == cap_mode)
 		{
 			LCDprint("Capacitance:", 1, 1);
@@ -252,9 +282,26 @@ void main (void)
 			TR0 = 0;
 
 			F = overflow_count * 0x10000L + TH0 * 0x100L + TL0;
-			cap = 1440000 / (5.0 * F); // kept as-is
 
-			sprintf(buf, "%lunF", cap);
+			if (F == 0) cap_nf = 0;
+			else cap_nf = (unsigned long)(1440000 / (5.0 * F)); // your original style
+
+			if (cap_unit_mode == CAP_UNIT_NF)
+			{
+				sprintf(buf, "%lunF", cap_nf);
+			}
+			else if (cap_unit_mode == CAP_UNIT_PF)
+			{
+				cap_pf = cap_nf * 1000UL;
+				sprintf(buf, "%lupF", cap_pf);
+			}
+			else // uF with decimals
+			{
+				uf_int = cap_nf / 1000UL;
+				uf_dec = cap_nf % 1000UL;
+				sprintf(buf, "%lu.%03luuF", uf_int, uf_dec);
+			}
+
 			LCDprint(buf, 2, 1);
 		}
 		else
@@ -263,7 +310,6 @@ void main (void)
 
 			adc_result = ReadADC(0x0F); // P2.2
 
-			// If open or near-short, show 0 (your earlier requirement)
 			if (adc_result >= OPEN_THRESHOLD || adc_result <= SHORT_THRESHOLD)
 			{
 				scaled = 0;
@@ -278,6 +324,6 @@ void main (void)
 			LCDprint(buf, 2, 1);
 		}
 
-		waitms(150);
+		waitms(120);
 	}
 }
